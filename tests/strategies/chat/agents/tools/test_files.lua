@@ -17,6 +17,20 @@ local T = new_set({
 
         h = require('tests.helpers')
         chat, agent = h.setup_chat_buffer()
+
+        -- Load the module containing apply_change and other necessary functions
+        _G.FilesModule = require("codecompanion.strategies.chat.agents.tools.files")
+
+        -- Make CompareLines available in the global scope for test functions
+        _G.CompareLines = function(lines1, lines2)
+          if lines1 == nil and lines2 == nil then return true end
+          if lines1 == nil or lines2 == nil then return false end
+          if #lines1 ~= #lines2 then return false end
+          for i = 1, #lines1 do
+            if lines1[i] ~= lines2[i] then return false end
+          end
+          return true
+        end
       ]])
     end,
     post_case = function()
@@ -358,6 +372,168 @@ T["files tool update lua dashes"] = function()
   local output = child.lua_get("vim.fn.readfile(_G.TEST_TMPFILE)")
   local expected = child.lua_get("vim.fn.readfile('tests/fixtures/files-output-7.lua')")
   h.eq_info(output, expected, child.lua_get("chat.messages[#chat.messages].content"))
+end
+
+-- NOTE: compare_lines is now defined in the pre_case hook as _G.CompareLines
+-- apply_change_test_cases is defined below and passed to child.lua context as _G.ApplyChangeTestCases
+
+local apply_change_test_cases = {
+    {
+      name = "Perfect match",
+      initial_lines = {"line1", "line2", "line3", "old_line", "line5", "line6", "line7"},
+      change = {pre = {"line1", "line2", "line3"}, old = {"old_line"}, new = {"new_line"}, post = {"line5", "line6", "line7"}, focus = {}},
+      expected_lines = {"line1", "line2", "line3", "new_line", "line5", "line6", "line7"},
+    },
+    {
+      name = "Slightly mismatched pre context (1/3 diff), should pass",
+      initial_lines = {"line_A", "line_B_original", "line_C", "old_content", "line_D", "line_E", "line_F"},
+      change = {pre = {"line_A", "line_B_modified", "line_C"}, old = {"old_content"}, new = {"new_content"}, post = {"line_D", "line_E", "line_F"}, focus = {}},
+      expected_lines = {"line_A", "line_B_original", "line_C", "new_content", "line_D", "line_E", "line_F"},
+    },
+    {
+      name = "Slightly mismatched post context (1/3 diff), should pass",
+      initial_lines = {"line_A", "line_B", "line_C", "old_content", "line_D_original", "line_E", "line_F"},
+      change = {pre = {"line_A", "line_B", "line_C"}, old = {"old_content"}, new = {"new_content"}, post = {"line_D_modified", "line_E", "line_F"}, focus = {}},
+      expected_lines = {"line_A", "line_B", "line_C", "new_content", "line_D_original", "line_E", "line_F"},
+    },
+    {
+      name = "Match with trim_spaces = true (indentation difference in pre/post)",
+      initial_lines = {"  line1", "    line2", "  line3", "  old_line", "    line5", "  line6"},
+      change = {pre = {"line1", "line2", "line3"}, old = {"old_line"}, new = {"new_line"}, post = {"line5", "line6"}, focus = {}},
+      expected_lines = {"  line1", "    line2", "  line3", "  new_line", "    line5", "  line6"},
+    },
+    {
+      name = "Match with trim_spaces = true (indentation difference in old line, fix_spaces applies)",
+      initial_lines = {"  line1", "    old_line_indented", "  line3"},
+      change = {pre = {"  line1"}, old = {"old_line_indented"}, new = {"new_line_inserted"}, post = {"  line3"}, focus = {}},
+      expected_lines = {"  line1", "    new_line_inserted", "  line3"},
+    },
+    {
+      name = "Match with trim_spaces = true (patch has extra space in old line, fix_spaces applies)",
+      initial_lines = {"  line1", "    old_line_indented", "  line3"},
+      change = {pre = {"  line1"}, old = {" old_line_indented"}, new = {"new_line_inserted"}, post = {"  line3"}, focus = {}},
+      expected_lines = {"  line1", "    new_line_inserted", "  line3"},
+    },
+    {
+      name = "Rejected: old lines do not match even if context is good",
+      initial_lines = {"line1", "line2", "line3", "actual_old_line", "line5", "line6", "line7"},
+      change = {pre = {"line1", "line2", "line3"}, old = {"expected_old_line_differs"}, new = {"new_line"}, post = {"line5", "line6", "line7"}, focus = {}},
+      expected_lines = nil, -- Expect rejection
+    },
+    {
+      name = "Rejected: very low context probability (all context lines mismatch)",
+      initial_lines = {"line1", "line2", "line3", "old_line", "line5", "line6", "line7"},
+      change = {pre = {"X", "Y", "Z"}, old = {"old_line"}, new = {"new_line"}, post = {"A", "B", "C"}, focus = {}},
+      expected_lines = nil, -- Expect rejection
+    },
+    {
+      name = "Pure insertion (no pre, post, old)",
+      initial_lines = {"line_before", "line_after"},
+      change = {pre = {}, old = {}, new = {"inserted_line1", "inserted_line2"}, post = {}, focus = {}},
+      expected_lines = {"inserted_line1", "inserted_line2", "line_before", "line_after"},
+    },
+    {
+      name = "Pure insertion at end of file",
+      initial_lines = {"line_A", "line_B"},
+      change = {pre = {"line_A", "line_B"}, old = {}, new = {"inserted_line_C"}, post = {}, focus = {}},
+      expected_lines = {"line_A", "line_B", "inserted_line_C"},
+    },
+    {
+      name = "Insertion with pre context",
+      initial_lines = {"context_A", "context_B", "follow_line"},
+      change = {pre = {"context_A", "context_B"}, old = {}, new = {"inserted_here"}, post = {}, focus = {}},
+      expected_lines = {"context_A", "context_B", "inserted_here", "follow_line"},
+    },
+    {
+      name = "Insertion with post context (less common, but test)",
+      initial_lines = {"pre_line", "context_A", "context_B"},
+      change = {pre = {}, old = {}, new = {"inserted_here"}, post = {"context_A", "context_B"}, focus = {}},
+      expected_lines = {"pre_line", "inserted_here", "context_A", "context_B"},
+    },
+    {
+      name = "Deletion of a line",
+      initial_lines = {"line_A", "line_to_delete", "line_B"},
+      change = {pre = {"line_A"}, old = {"line_to_delete"}, new = {}, post = {"line_B"}, focus = {}},
+      expected_lines = {"line_A", "line_B"},
+    },
+    {
+      name = "Appending to file (old lines are empty, pre is last lines of file)",
+      initial_lines = {"last_line_1", "last_line_2"},
+      change = {pre = {"last_line_1", "last_line_2"}, old = {}, new = {"appended_line"}, post = {}, focus = {}},
+      expected_lines = {"last_line_1", "last_line_2", "appended_line"},
+    },
+    {
+      name = "Focus line respected",
+      initial_lines = {"header", "content1", "target_focus", "content2", "old_line_here", "content3"},
+      change = {pre = {"content2"}, old = {"old_line_here"}, new = {"new_line_here"}, post = {"content3"}, focus = {"target_focus"}},
+      expected_lines = {"header", "content1", "target_focus", "content2", "new_line_here", "content3"},
+    },
+    {
+      name = "Focus line respected (trim_spaces)",
+      initial_lines = {"  header", "  content1", "  target_focus  ", "  content2", "    old_line_here", "  content3"},
+      change = {pre = {"content2"}, old = {"old_line_here"}, new = {"new_line_here"}, post = {"content3"}, focus = {"target_focus"}},
+      expected_lines = {"  header", "  content1", "  target_focus  ", "  content2", "    new_line_here", "  content3"},
+    },
+    {
+      name = "Focus line not found, patch rejected",
+      initial_lines = {"header", "content1", "other_content", "content2", "old_line_here", "content3"},
+      change = {pre = {"content2"}, old = {"old_line_here"}, new = {"new_line_here"}, post = {"content3"}, focus = {"missing_target_focus"}},
+      expected_lines = nil,
+    },
+    {
+        name = "Insertion with trim_spaces and pre-context to guide indentation",
+        initial_lines = {"function example()", "    return true", "end"},
+        change = {
+            pre = {"    return true"}, old = {}, new = {"-- new comment line"}, post = {}, focus = {"function example()"}
+        },
+        expected_lines = {"function example()", "    return true", "    -- new comment line", "end"},
+    },
+    {
+        name = "Insertion at start of file with post-context to guide indentation (no fix_spaces expected)",
+        initial_lines = {"    first_line_indented", "    second_line_indented"},
+        change = {
+            pre = {}, old = {}, new = {"newline_at_start"}, post = {"    first_line_indented"} , focus = {}
+        },
+        expected_lines = {"newline_at_start", "    first_line_indented", "    second_line_indented"},
+    },
+}
+
+-- Pass the test cases to the child neovim context
+child.lua([[
+  _G.ApplyChangeTestCases = vim.deepcopy(...)
+]], apply_change_test_cases)
+
+
+-- Dynamically generate test functions for each case
+for idx, tc_data in ipairs(apply_change_test_cases) do
+  local test_name = string.format("apply_change: %s (TC %d)", tc_data.name, idx)
+  T[test_name] = function()
+    child.lua([[
+      local current_tc_idx = ...
+      local tc = _G.ApplyChangeTestCases[current_tc_idx]
+
+      -- Deepcopy initial_lines as apply_change might modify it or its subtables if not careful
+      local current_initial_lines = vim.deepcopy(tc.initial_lines)
+      local actual_new_lines = _G.FilesModule.apply_change(current_initial_lines, tc.change)
+      local pass = _G.CompareLines(actual_new_lines, tc.expected_lines)
+
+      if not pass then
+        -- Construct a detailed failure message
+        local msg = string.format("Test FAILED: %s\nExpected: %s\nActual:   %s",
+                                  tc.name,
+                                  vim.inspect(tc.expected_lines),
+                                  vim.inspect(actual_new_lines))
+        -- Optionally print more details about the change object itself
+        -- msg = msg .. "\nChange object: " .. vim.inspect(tc.change)
+        assert(false, msg)
+      else
+        -- Optional: print a success message for each test case if needed for debugging,
+        -- but MiniTest usually only shows failures.
+        -- print("Test PASSED: " .. tc.name)
+        assert(true) -- Indicate test success explicitly
+      end
+    ]], idx) -- Pass the index to the child.lua context
+  end
 end
 
 return T

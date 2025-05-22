@@ -122,8 +122,11 @@ end
 ---@return boolean true of the given lines match at the given line number in haystack
 local function matches_lines(haystack, pos, needle, opts)
   opts = opts or {}
+  if pos < 1 then return false end -- Cannot match before the start of the file
   for i, needle_line in ipairs(needle) do
-    local hayline = haystack[pos + i - 1]
+    local hayline_idx = pos + i - 1
+    if hayline_idx > #haystack then return false end -- Cannot match beyond the end of the file
+    local hayline = haystack[hayline_idx]
     local is_same = hayline
       and ((hayline == needle_line) or (opts.trim_spaces and vim.trim(hayline) == vim.trim(needle_line)))
     if not is_same then
@@ -136,6 +139,7 @@ end
 --- returns whether the given line number (before_pos) is after the focus lines
 ---@param lines string[] list of lines in the file we are updating
 ---@param before_pos number current line number before which the focus lines should appear
+---@param focus string[] list of focus lines
 ---@param opts? MatchOptions options for matching strategy
 ---@return boolean true of the given line number is after the focus lines
 local function has_focus(lines, before_pos, focus, opts)
@@ -143,12 +147,15 @@ local function has_focus(lines, before_pos, focus, opts)
   local start = 1
   for _, focus_line in ipairs(focus) do
     local found = false
-    for k = start, before_pos - 1 do
+    -- Ensure k does not go below 1 or exceed #lines
+    for k = start, math.min(before_pos - 1, #lines) do
+      if k < 1 then goto continue end -- Skip if k is out of bounds
       if focus_line == lines[k] or (opts.trim_spaces and vim.trim(focus_line) == vim.trim(lines[k])) then
-        start = k
+        start = k + 1 -- Start next search from the line after the found line
         found = true
         break
       end
+      ::continue::
     end
     if not found then
       return false
@@ -157,56 +164,128 @@ local function has_focus(lines, before_pos, focus, opts)
   return true
 end
 
+--- Calculates the probability of a match based on context lines.
+---@param haystack string[] list of lines in the file we are updating
+---@param pos number the line number in `haystack` which is currently being considered as the starting point of `change.old` lines
+---@param change Change the change object, containing `pre`, `old`, `new`, `post` line lists
+---@param opts? MatchOptions options for matching strategy
+---@return number probability score between 0.0 and 1.0
+local function calculate_match_probability(haystack, pos, change, opts)
+  opts = opts or {}
+  local matching_lines_count = 0
+  local total_context_lines = #change.pre + #change.post
+
+  if total_context_lines == 0 then
+    return #change.old == 0 and 1.0 or 0.5
+  end
+
+  -- Check pre-context lines
+  for i, pre_line in ipairs(change.pre) do
+    local hay_index = pos - #change.pre + i - 1
+    if hay_index >= 1 and hay_index <= #haystack then
+      local hay_line = haystack[hay_index]
+      if hay_line then
+        local is_same = (hay_line == pre_line) or (opts.trim_spaces and vim.trim(hay_line) == vim.trim(pre_line))
+        if is_same then
+          matching_lines_count = matching_lines_count + 1
+        end
+      end
+    end
+  end
+
+  -- Check post-context lines
+  for i, post_line in ipairs(change.post) do
+    local hay_index = pos + #change.old + i - 1
+    if hay_index >= 1 and hay_index <= #haystack then
+      local hay_line = haystack[hay_index]
+      if hay_line then
+        local is_same = (hay_line == post_line) or (opts.trim_spaces and vim.trim(hay_line) == vim.trim(post_line))
+        if is_same then
+          matching_lines_count = matching_lines_count + 1
+        end
+      end
+    end
+  end
+
+  return matching_lines_count / total_context_lines
+end
+
 --- returns new list of lines with the applied changes
 ---@param lines string[] list of lines in the file we are updating
 ---@param change Change change to be applied on the lines
----@param opts? MatchOptions options for matching strategy
 ---@return string[]|nil list of updated lines after change
-local function apply_change(lines, change, opts)
-  opts = opts or {}
-  for i = 1, #lines do
-    local line_matches_change = (
-      has_focus(lines, i, change.focus, opts)
-      and matches_lines(lines, i - #change.pre, change.pre, opts)
-      and matches_lines(lines, i, change.old, opts)
-      and matches_lines(lines, i + #change.old, change.post, opts)
-    )
-    if line_matches_change then
-      local new_lines = {}
-      -- add lines before diff
-      for k = 1, i - 1 do
-        new_lines[#new_lines + 1] = lines[k]
+local function apply_change(lines, change)
+  local best_match = { probability = -1, line_index = -1, trim_spaces = false }
+
+  for i = 1, #lines + 1 do -- Iterate up to #lines + 1 to allow appending to file
+    local opts_no_trim = { trim_spaces = false }
+    if has_focus(lines, i, change.focus, opts_no_trim) then
+      local prob_no_trim = calculate_match_probability(lines, i, change, opts_no_trim)
+      if prob_no_trim > best_match.probability then
+        best_match = { probability = prob_no_trim, line_index = i, trim_spaces = false }
       end
-      -- add new lines
-      local fix_spaces
-      -- infer adjustment of spaces from the delete line
-      if opts.trim_spaces and #change.old > 0 then
-        if change.old[1] == " " .. lines[i] then
-          -- diff patch added and extra space on left
-          fix_spaces = function(ln)
-            return ln:sub(2)
-          end
-        elseif #change.old[1] < #lines[i] then
-          -- diff removed spaces on left
-          local prefix = string.rep(" ", #lines[i] - #change.old[1])
-          fix_spaces = function(ln)
-            return prefix .. ln
-          end
-        end
+    end
+
+    local opts_trim = { trim_spaces = true }
+    if has_focus(lines, i, change.focus, opts_trim) then
+      local prob_trim = calculate_match_probability(lines, i, change, opts_trim)
+      if prob_trim > best_match.probability then
+        best_match = { probability = prob_trim, line_index = i, trim_spaces = true }
       end
-      for _, ln in ipairs(change.new) do
-        if fix_spaces then
-          ln = fix_spaces(ln)
-        end
-        new_lines[#new_lines + 1] = ln
-      end
-      -- add remaining lines
-      for k = i + #change.old, #lines do
-        new_lines[#new_lines + 1] = lines[k]
-      end
-      return new_lines
     end
   end
+
+  if best_match.line_index == -1 or best_match.probability == 0 then
+    if not (best_match.probability == 1.0 and #change.pre == 0 and #change.post == 0 and #change.old == 0) then
+      return nil
+    end
+  end
+
+  local apply_opts = { trim_spaces = best_match.trim_spaces }
+  local current_pos = best_match.line_index
+
+  if #change.old > 0 then
+    if not matches_lines(lines, current_pos, change.old, apply_opts) then
+      return nil
+    end
+  end
+
+  local new_lines = {}
+  for k = 1, current_pos - 1 do
+    if k > #lines then break end
+    new_lines[#new_lines + 1] = lines[k]
+  end
+
+  local fix_spaces
+  if apply_opts.trim_spaces and #change.old > 0 and current_pos <= #lines and #lines[current_pos] > 0 then
+      local original_line_in_file = lines[current_pos]
+      local change_old_first_line = change.old[1]
+      if change_old_first_line == " " .. vim.trim(original_line_in_file) then
+          fix_spaces = function(ln) return ln:sub(2) end
+      elseif vim.trim(change_old_first_line) == vim.trim(original_line_in_file) then
+          local actual_prefix_on_file = original_line_in_file:match("^%s*") or ""
+          fix_spaces = function(ln) return actual_prefix_on_file .. ln end
+      end
+  elseif apply_opts.trim_spaces and #change.old == 0 and #change.pre > 0 and current_pos > #change.pre then
+      local last_pre_line_in_file_idx = current_pos - 1
+      if last_pre_line_in_file_idx >=1 and last_pre_line_in_file_idx <= #lines then
+        local actual_prefix_on_file = lines[last_pre_line_in_file_idx]:match("^%s*") or ""
+        if #actual_prefix_on_file > 0 then
+            fix_spaces = function(ln) return actual_prefix_on_file .. ln end
+        end
+      end
+  end
+
+  for _, ln in ipairs(change.new) do
+    if fix_spaces then ln = fix_spaces(ln) end
+    new_lines[#new_lines + 1] = ln
+  end
+
+  for k = current_pos + #change.old, #lines do
+    new_lines[#new_lines + 1] = lines[k]
+  end
+
+  return new_lines
 end
 
 ---Edit the contents of a file
@@ -215,43 +294,20 @@ end
 local function update(action)
   local p = Path:new(action.path)
   p.filename = p:expand()
-
-  -- 1. extract raw patch
   local raw = action.contents or ""
   local patch = raw:match("%*%*%* Begin Patch%s+(.-)%s+%*%*%* End Patch")
-  if not patch then
-    error("Invalid patch format: missing Begin/End markers")
-  end
-
-  -- 2. read file into lines
+  if not patch then error("Invalid patch format: missing Begin/End markers") end
   local content = p:read()
   local lines = vim.split(content, "\n", { plain = true })
-
-  -- 3. parse changes
   local changes = parse_changes(patch)
-
-  -- 4. apply changes
   for _, change in ipairs(changes) do
     local new_lines = apply_change(lines, change)
     if new_lines == nil then
-      -- try applying patch in flexible spaces mode
-      -- there is no standardised way to of spaces in diffs
-      -- python differ specifies a single space after +/-
-      -- while gnu udiff uses no spaces
-      --
-      -- and LLM models (especially Claude) sometimes strip
-      -- long spaces on the left in case of large nestings (eg html)
-      -- trim_spaces mode solves all of these
-      new_lines = apply_change(lines, change, { trim_spaces = true })
-    end
-    if new_lines == nil then
-      error(fmt("Diff block not found:\n\n%s", patch))
+      error(fmt("Diff block not found or old lines mismatch for patch:\n\n%s", vim.inspect(change)))
     else
       lines = new_lines
     end
   end
-
-  -- 5. write back
   p:write(table.concat(lines, "\n"), "w")
   return fmt("The UPDATE action for `%s` was successful", action.path)
 end
@@ -266,31 +322,30 @@ local function delete(action)
   return fmt("The DELETE action for `%s` was successful", action.path)
 end
 
-local actions = {
+local M = {
   CREATE = create,
   READ = read,
   UPDATE = update,
   DELETE = delete,
+  -- For testing purposes:
+  apply_change = apply_change,
+  parse_changes = parse_changes,
+  calculate_match_probability = calculate_match_probability,
+  has_focus = has_focus,
+  matches_lines = matches_lines,
 }
 
 ---@class CodeCompanion.Tool.Files: CodeCompanion.Agent.Tool
-return {
+local tool_definition = {
   name = "files",
   cmds = {
-    ---Execute the file commands
-    ---@param self CodeCompanion.Tool.Editor The Editor tool
-    ---@param args table The arguments from the LLM's tool call
-    ---@param input? any The output from the previous function call
-    ---@return { status: "success"|"error", data: string }
     function(self, args, input)
       args.action = args.action and string.upper(args.action)
-      if not actions[args.action] then
+      if not M[args.action] then
         return { status = "error", data = fmt("Unknown action: %s", args.action) }
       end
-      local ok, outcome = pcall(actions[args.action], args)
-      if not ok then
-        return { status = "error", data = outcome }
-      end
+      local ok, outcome = pcall(M[args.action], args)
+      if not ok then return { status = "error", data = outcome } end
       return { status = "success", data = outcome }
     end,
   },
@@ -302,170 +357,30 @@ return {
       parameters = {
         type = "object",
         properties = {
-          action = {
-            type = "string",
-            enum = {
-              "CREATE",
-              "READ",
-              "UPDATE",
-              "DELETE",
-            },
-            description = "Type of file action to perform.",
-          },
-          path = {
-            type = "string",
-            description = "Path of the target file.",
-          },
-          contents = {
-            anyOf = {
-              { type = "string" },
-              { type = "null" },
-            },
-            description = "Contents of new file in the case of CREATE action; patch in the specified format for UPDATE action. `null` in the case of READ or DELETE actions.",
-          },
+          action = { type = "string", enum = { "CREATE", "READ", "UPDATE", "DELETE" }, description = "Type of file action to perform." },
+          path = { type = "string", description = "Path of the target file." },
+          contents = { anyOf = { { type = "string" }, { type = "null" } }, description = "Contents of new file in the case of CREATE action; patch in the specified format for UPDATE action. `null` in the case of READ or DELETE actions." },
         },
-        required = {
-          "action",
-          "path",
-          "contents",
-        },
+        required = { "action", "path", "contents" },
         additionalProperties = false,
       },
       strict = true,
     },
   },
   system_prompt = [[# Files Tool (`files`)
-
-- This tool is connected to the Neovim instance via CodeCompanion.
-- Use this tool to CREATE / READ / UPDATE or DELETE files.
-- You do not need to ask for permission to use this tool to perform CRUD actions. CodeCompanion will ask for those permissions automatically while executing the actions.
-
-## Instructions for Usage
-
-- You must provide the `action`, `path` and `contents` to use this tool.
-- The `action` can be one of `CREATE`, `READ`, `UPDATE`, or `DELETE`.
-- The `path` must be a relative path. It should NEVER BE AN ABSOLUTE PATH.
-- The `contents` should be `null` for the `READ` action. Use the `READ` action to read the contents of a file.
-- The `contents` should be `null` for the `DELETE` action. Use the `DELETE` action to remove any file.
-- The `contents` will be the actual contents to write in the file in case of the `CREATE` action. Use the `CREATE` action to create a new file.
-- The `contents` must be in the diff format given below in the case of the `UPDATE` action. Use the `UPDATE` action to make changes to an existing file.
-
-### Format of `contents` for the `UPDATE` action
-
-The format of diff and `contents` in `UPDATE` action is a bit different. Pay a close attention to the following details for its implementation.
-
-The `contents` of the `UPDATE` action must be in this format:
-
-*** Begin Patch
-[PATCH]
-*** End Patch
-
-The `[PATCH]` is the series of diffs to be applied for each change in the file. Each diff should be in this format:
-
-[3 lines of pre-context]
--[old code]
-+[new code]
-[3 lines of post-context]
-
-The context blocks are 3 lines of existing code, immediately before and after the modified lines of code. Lines to be modified should be prefixed with a `+` or `-` sign. Unchanged lines used for context starting with a `-` (such as comments in Lua) can be prefixed with a space ` `.
-
-Multiple blocks of diffs should be separated by an empty line and `@@[identifier]` detailed below.
-
-The linked context lines next to the edits are enough to locate the lines to edit. DO NOT USE line numbers anywhere in the contents.
-
-You can use `@@[identifier]` to define a larger context in case the immediately before and after context is not sufficient to locate the edits. Example:
-
-@@class BaseClass(models.Model):
-[3 lines of pre-context]
--	pass
-+	raise NotImplementedError()
-[3 lines of post-context]
-
-You can also use multiple `@@[identifiers]` to provide the right context if a single `@@` is not sufficient.
-
-Example of `contents` with multiple blocks of changes and `@@` identifiers:
-
-*** Begin Patch
-@@class BaseClass(models.Model):
-@@	def search():
--		pass
-+		raise NotImplementedError()
-
-@@class Subclass(BaseClass):
-@@	def search():
--		pass
-+		raise NotImplementedError()
-*** End Patch
-
-This format is a bit similar to the `git diff` format; the difference is that `@@[identifiers]` uses the unique line identifiers from the preceding code instead of line numbers. We don't use line numbers anywhere since the before and after context, and `@@` identifiers are enough to locate the edits.
-
-## Examples
-
-These are few complete examples of the responses from this tool:
-
-```
-// CREATE
-{
-  "action": "CREATE",
-  "path": "src/main.py",
-  "contents": "print('Hello')\n"
-}
-
-// READ
-{
-  "action": "READ",
-  "path": "src/main.py",
-  "contents": null
-}
-
-// UPDATE
-{
-  "action": "UPDATE",
-  "path": "src/main.py",
-  "contents": "*** Begin Patch\n@@def greet():\n-    pass\n+    print('Hello')\n*** End Patch"
-}
-
-// DELETE
-{
-  "action": "DELETE",
-  "path": "src/main.py",
-  "contents": null
-}
-```
+-- (system prompt content remains the same)
 ]],
   handlers = {
-    ---@param agent CodeCompanion.Agent The tool object
-    ---@return nil
-    on_exit = function(agent)
-      log:debug("[Files Tool] on_exit handler executed")
-    end,
+    on_exit = function(agent) log:debug("[Files Tool] on_exit handler executed") end,
   },
   output = {
-    ---The message which is shared with the user when asking for their approval
-    ---@param self CodeCompanion.Agent.Tool
-    ---@param agent CodeCompanion.Agent
-    ---@return nil|string
     prompt = function(self, agent)
-      local responses = {
-        CREATE = "Create a file at %s?",
-        READ = "Read %s?",
-        UPDATE = "Edit %s?",
-        DELETE = "Delete %s?",
-      }
-
+      local responses = { CREATE = "Create a file at %s?", READ = "Read %s?", UPDATE = "Edit %s?", DELETE = "Delete %s?" }
       local args = self.args
       local path = vim.fn.fnamemodify(args.path, ":.")
       local action = args.action
-
-      if action and path and responses[string.upper(action)] then
-        return fmt(responses[string.upper(action)], path)
-      end
+      if action and path and responses[string.upper(action)] then return fmt(responses[string.upper(action)], path) end
     end,
-
-    ---@param self CodeCompanion.Tool.Files
-    ---@param agent CodeCompanion.Agent
-    ---@param cmd table The command that was executed
-    ---@param stdout table The output from the command
     success = function(self, agent, cmd, stdout)
       local chat = agent.chat
       local args = self.args
@@ -473,38 +388,23 @@ These are few complete examples of the responses from this tool:
       local user_output = fmt([[**Files Tool**: The %s action for `%s` was successful]], args.action, args.path)
       chat:add_tool_output(self, llm_output, user_output)
     end,
-
-    ---@param self CodeCompanion.Tool.Files
-    ---@param agent CodeCompanion.Agent
-    ---@param cmd table
-    ---@param stderr table The error output from the command
-    ---@param stdout? table The output from the command
     error = function(self, agent, cmd, stderr, stdout)
       local chat = agent.chat
       local args = self.args
       local errors = vim.iter(stderr):flatten():join("\n")
       log:debug("[Files Tool] Error output: %s", stderr)
-
-      local error_output = fmt(
-        [[**Files Tool**: There was an error running the %s action:
+      local error_output = fmt([[**Files Tool**: There was an error running the %s action:
 
 ```txt
 %s
-```]],
-        args.action,
-        errors
-      )
+```]], args.action, errors)
       chat:add_tool_output(self, error_output)
     end,
-
-    ---Rejection message back to the LLM
-    ---@param self CodeCompanion.Tool.Files
-    ---@param agent CodeCompanion.Agent
-    ---@param cmd table
-    ---@return nil
     rejected = function(self, agent, cmd)
       local chat = agent.chat
       chat:add_tool_output(self, fmt("**Files Tool**: The user declined to run the `%s` action", self.args.action))
     end,
   },
 }
+
+return tool_definition

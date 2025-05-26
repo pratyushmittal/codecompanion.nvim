@@ -8,93 +8,10 @@ local config = require("codecompanion.config")
 local keymaps = require("codecompanion.utils.keymaps")
 local log = require("codecompanion.utils.log")
 local ui = require("codecompanion.utils.ui")
+local patches = require("codecompanion.helpers.patches")
 
 local api = vim.api
 local fmt = string.format
-
-local diff_started = false
-
--- To keep track of the changes made to the buffer, we store them in this table
-local deltas = {}
-
----Add a delta to the list of deltas
----@param bufnr number
----@param line number
----@param delta number
----@return nil
-local function add_delta(bufnr, line, delta)
-  table.insert(deltas, { bufnr = bufnr, line = line, delta = delta })
-end
-
----Calculate if there is any intersection between the lines
----@param bufnr number
----@param line number
----@return number
-local function intersect(bufnr, line)
-  local delta = 0
-  for _, v in ipairs(deltas) do
-    if bufnr == v.bufnr and line > v.line then
-      delta = delta + v.delta
-    end
-  end
-  return delta
-end
-
----Delete lines from the buffer
----@param args {buffer: number, start_line: number, end_line: number}
----@return nil
-local function delete(args)
-  log:debug("[Editor Tool] Deleting code from the buffer")
-
-  local start_line = tonumber(args.start_line)
-  if not start_line then
-    return { status = "error", data = "No start line number provided by the LLM" }
-  end
-  if start_line == 0 then
-    start_line = 1
-  end
-
-  local end_line = tonumber(args.end_line)
-  if not end_line then
-    return { status = "error", data = "No end line number provided by the LLM" }
-  end
-  if end_line == 0 then
-    end_line = 1
-  end
-
-  local delta = intersect(args.buffer, start_line)
-
-  api.nvim_buf_set_lines(args.buffer, start_line + delta - 1, end_line + delta, false, {})
-  add_delta(args.buffer, start_line, (start_line - end_line - 1))
-  return { status = "success", data = nil }
-end
-
----Add lines to the buffer
----@param args {buffer: number, start_line: number, code: string}
----@return nil
-local function add(args)
-  log:debug("[Editor Tool] Adding code to buffer")
-
-  if not args.start_line then
-    return { status = "error", data = "No line number or replace request provided by the LLM" }
-  end
-
-  local start_line = tonumber(args.start_line)
-  if not start_line then
-    return { status = "error", data = "No line number provided by the LLM" }
-  end
-  if start_line == 0 then
-    start_line = 1
-  end
-
-  local delta = intersect(args.buffer, start_line)
-
-  local lines = vim.split(args.code, "\n", { plain = true, trimempty = false })
-  api.nvim_buf_set_lines(args.buffer, start_line + delta - 1, start_line + delta - 1, false, lines)
-
-  add_delta(args.buffer, start_line, #lines)
-  return { status = "success", data = nil }
-end
 
 ---@class CodeCompanion.Tool.Editor: CodeCompanion.Agent.Tool
 return {
@@ -110,56 +27,29 @@ return {
     ---@return nil|{ status: "success"|"error", data: string }
     function(self, args, input)
       ---Run the action
-      ---@param run_args {buffer: number, action: string, code: string, start_line: number, end_line: number}
+      ---@param run_args {buffer: number, patch_text: string}
       ---@return { status: "success"|"error", data: string }
       local function run(run_args)
-        local winnr = ui.buf_get_win(run_args.buffer)
         -- log:trace("[Editor Tool] request: %s", run_args)
 
-        -- Diff the buffer
-        if
-          not vim.g.codecompanion_auto_tool_mode
-          and (
-            not diff_started
-            and config.display.diff.enabled
-            and run_args.buffer
-            and vim.bo[run_args.buffer].buftype ~= "terminal"
-          )
-        then
-          local provider = config.display.diff.provider
-          local ok, diff = pcall(require, "codecompanion.providers.diff." .. provider)
+        local current_lines = api.nvim_buf_get_lines(run_args.buffer, 0, -1, false)
+        local parsed_changes, parse_err = patches.parse_changes(run_args.patch_text)
 
-          if ok and winnr then
-            ---@type CodeCompanion.DiffArgs
-            local diff_args = {
-              bufnr = run_args.buffer,
-              contents = api.nvim_buf_get_lines(run_args.buffer, 0, -1, true),
-              filetype = api.nvim_buf_get_option(run_args.buffer, "filetype"),
-              winnr = winnr,
-            }
-            ---@type CodeCompanion.Diff
-            diff = diff.new(diff_args)
-            keymaps
-              .new({
-                bufnr = run_args.buffer,
-                callbacks = require("codecompanion.strategies.inline.keymaps"),
-                data = { diff = diff },
-                keymaps = config.strategies.inline.keymaps,
-              })
-              :set()
+        if not parsed_changes then
+          log:error(("[Editor Tool] Failed to parse patch_text: %s"):format(parse_err))
+          return { status = "error", data = "Failed to parse patch_text: " .. (parse_err or "unknown error") }
+        end
 
-            diff_started = true
+        for i, change in ipairs(parsed_changes) do
+          local new_lines_candidate = patches.apply_change(current_lines, change)
+          if not new_lines_candidate then
+            log:error(("[Editor Tool] Failed to apply change %d: %s"):format(i, patches.get_change_string(change)))
+            return { status = "error", data = "Failed to apply one or more changes from the patch." }
           end
+          current_lines = new_lines_candidate
         end
 
-        if run_args.action == "add" then
-          add(run_args)
-        elseif run_args.action == "delete" then
-          delete(run_args)
-        elseif run_args.action == "update" then
-          delete(run_args)
-          add(run_args)
-        end
+        api.nvim_buf_set_lines(run_args.buffer, 0, -1, false, current_lines)
 
         --TODO: Scroll to buffer and the new lines
 
@@ -184,6 +74,11 @@ return {
         return { status = "error", data = "Invalid buffer number" }
       end
 
+      -- Validate patch_text exists
+      if not args.patch_text or args.patch_text == "" then
+        return { status = "error", data = "No patch_text provided" }
+      end
+
       return run(args)
     end,
   },
@@ -191,44 +86,22 @@ return {
     type = "function",
     ["function"] = {
       name = "editor",
-      description = "Add/edit/delete contents of a buffer in the user's Neovim instance",
+      description = "Applies a textual patch to a buffer in the user's Neovim instance.",
       parameters = {
         type = "object",
         properties = {
-          action = {
-            type = "string",
-            enum = { "add", "update", "delete" },
-            description = "Action to perform: 'add', 'update', or 'delete'.",
-          },
           buffer = {
             type = "integer",
             description = "Neovim buffer number",
           },
-          code = {
-            anyOf = {
-              { type = "string" },
-              { type = "null" },
-            },
-            description = "String of code to add/update; set to `null` when deleting.",
-          },
-          start_line = {
-            type = "integer",
-            description = "1‑based start line where the action begins.",
-          },
-          end_line = {
-            anyOf = {
-              { type = "integer" },
-              { type = "null" },
-            },
-            description = "1‑based inclusive end line; set to `null` for add actions.",
+          patch_text = {
+            type = "string",
+            description = "A textual patch in the specified diff format containing the changes to be applied to the buffer.",
           },
         },
         required = {
-          "action",
           "buffer",
-          "code",
-          "start_line",
-          "end_line",
+          "patch_text",
         },
         additionalProperties = false,
       },
@@ -239,31 +112,70 @@ return {
 
 ## CONTEXT
 - You have access to an editor tool running within CodeCompanion, in Neovim.
-- You can use it to add, edit or delete code in a Neovim buffer, via a buffer number that the user has provided to you.
-- You can specify line numbers to add, edit or delete code and CodeCompanion will carry out the action in the buffer, on your behalf.
+- You can use it to apply patches to a Neovim buffer, via a buffer number that the user has provided to you.
+- You must provide changes in a specific patch format.
 
 ## OBJECTIVE
-- To implement code changes in a Neovim buffer.
+- To implement code changes in a Neovim buffer by providing a patch.
+
+## PATCH FORMAT
+%s
 
 ## RESPONSE
-- Only invoke this tool when the user specifically asks.
-- Use this tool strictly for code editing.
-- If the user asks you to write specific code, do so to the letter, paying great attention.
-- This tool can be called multiple times to make multiple changes to the same buffer.
+- Only invoke this tool when the user specifically asks for code modifications.
+- Use this tool strictly for applying code changes as patches.
+- If the user asks you to write or modify code, generate a patch in the format described above.
 - If the user has not provided you with a buffer number, you must ask them for one.
-- Ensure that the code you write is syntactically correct and valid and that indentations are correct.
+- Ensure that the code in your patch is syntactically correct and that indentations are accurately represented.
+- The `patch_text` parameter should contain *only* the patch itself, starting with `*** Begin Patch` and ending with `*** End Patch`. Do not include any other explanatory text or markdown formatting around the patch block in the `patch_text` parameter.
 
 ## POINTS TO NOTE
-- This tool can be used alongside other tools within CodeCompanion
+- This tool can be used alongside other tools within CodeCompanion.
+- Multiple sets of changes (diffs) can be included in a single patch.
+]], [[
+*** Begin Patch
+[PATCH]
+*** End Patch
+
+The `[PATCH]` is the series of diffs to be applied for each change in the file. Each diff should be in this format:
+
+[3 lines of pre-context]
+-[old code]
++[new code]
+[3 lines of post-context]
+
+The context blocks are 3 lines of existing code, immediately before and after the modified lines of code. Lines to be modified should be prefixed with a `+` or `-` sign. Unchanged lines used for context starting with a `-` (such as comments in Lua) can be prefixed with a space ` `.
+
+Multiple blocks of diffs should be separated by an empty line and `@@[identifier]` detailed below.
+
+The linked context lines next to the edits are enough to locate the lines to edit. DO NOT USE line numbers anywhere in the patch.
+
+You can use `@@[identifier]` to define a larger context in case the immediately before and after context is not sufficient to locate the edits. Example:
+
+@@class BaseClass(models.Model):
+[3 lines of pre-context]
+-	pass
++	raise NotImplementedError()
+[3 lines of post-context]
+
+You can also use multiple `@@[identifiers]` to provide the right context if a single `@@` is not sufficient.
+
+Example with multiple blocks of changes and `@@` identifiers:
+
+*** Begin Patch
+@@class BaseClass(models.Model):
+@@	def search():
+-		pass
++		raise NotImplementedError()
+
+@@class Subclass(BaseClass):
+@@	def search():
+-		pass
++		raise NotImplementedError()
+*** End Patch
+
+This format is a bit similar to the `git diff` format; the difference is that `@@[identifiers]` uses the unique line identifiers from the preceding code instead of line numbers. We don't use line numbers anywhere since the before and after context, and `@@` identifiers are enough to locate the edits.
 ]]),
-  handlers = {
-    ---@param self CodeCompanion.Tool.Editor
-    ---@param agent CodeCompanion.Agent
-    on_exit = function(self, agent)
-      deltas = {}
-      diff_started = false
-    end,
-  },
   output = {
     ---@param self CodeCompanion.Tool.Editor
     ---@param agent CodeCompanion.Agent
@@ -274,18 +186,15 @@ return {
       local args = self.args
       local buf = args.buffer
 
-      if args.action == "delete" then
-        local count = args.end_line - args.start_line + 1
-        local short = fmt("**Editor Tool:** Deleted %d line(s) in buffer %d", count, buf)
-        return chat:add_tool_output(self, short)
-      end
-
-      local lines = vim.split(args.code or "", "\n", { plain = true, trimempty = false })
-      local count = #lines
-      local verb = args.action == "add" and "Added" or "Updated"
-      local short = fmt("**Editor Tool:** %s %d line(s) in buffer %d", verb, count, buf)
-      local ft = vim.bo[buf].filetype
-      local full = fmt("%s:\n```%s\n%s\n```", short, ft, table.concat(lines, "\n"))
+      -- Since we don't have action, code, start_line, end_line anymore,
+      -- we simplify the output message.
+      -- We could potentially count the number of changes in the patch_text
+      -- or the number of lines affected if that information is needed.
+      local short = fmt("**Editor Tool:** Applied patch to buffer %d", buf)
+      -- For the full message, we could show the patch_text itself,
+      -- but it might be too verbose. A simple confirmation is probably best.
+      local ft = "diff" -- Hardcode to diff for the patch text
+      local full = fmt("%s:\n```%s\n%s\n```", short, ft, args.patch_text) -- Show the applied patch
 
       return chat:add_tool_output(self, full, short)
     end,
